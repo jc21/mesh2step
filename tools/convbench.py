@@ -15,6 +15,9 @@ os.environ.update({"MESH2STEP_NATIVE": os.path.expanduser("~/.local/share/mesh2s
                    "MESH2STEP_EDGEBUILD_TIMEOUT_S": "900", "MESH2STEP_SLOTS": "1"})
 os.environ.pop("MESH2STEP_RECON", None)                # the paid AI rebuild never runs here
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
+# the feature pass runs as "python -m mesh2step.feature": without this its subprocess imports the INSTALLED
+# (production) package, not this checkout (s2 measured production's serial builders on parts 12, 23, 39)
+os.environ["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src"), str(ROOT), os.environ.get("PYTHONPATH", "")])
 os.chdir(ROOT)
 
 import mesh2step                                        # noqa: E402
