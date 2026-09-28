@@ -232,7 +232,7 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
                 log=None, keep: Path | None = None) -> dict | None:
     """Try every builder; keep the qualifying build closest to the mesh volume. keep: also copy every build
     and its measures there (cands.json), for a choice made later against the engine's cylinder count."""
-    stl, out = Path(stl), Path(out)
+    stl, out = Path(stl), (Path(out) if out is not None else None)   # None: collect only (--collect)
     tri = _mesh(stl)
     mesh_radii = None
     best = None

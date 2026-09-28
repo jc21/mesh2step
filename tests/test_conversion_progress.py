@@ -160,3 +160,33 @@ def test_a_timed_out_candidate_is_recorded_as_such(tmp_path, monkeypatch):
     assert feature.reconstruct(stl, tmp_path / "out.step", timeout=1.0) is None
     recs = [json.loads(l) for l in log.read_text().splitlines()]
     assert recs[-1]["state"] == "timeout" and recs[-1]["seconds"] >= 1.0
+
+
+def test_collect_then_choose_picks_what_reconstruct_picks(tmp_path, monkeypatch):
+    """The feature builders run beside the engine (--collect) and the choice is made after it (--choose): the same
+    build must win as with reconstruct() against the same engine cylinder count. (The first --collect crashed on
+    Path(None) and the server silently served the engine STEP instead.)"""
+    import trimesh
+    mesh = trimesh.creation.cylinder(radius=10.0, height=20.0, sections=256)
+    stl = tmp_path / "cyl.stl"
+    mesh.export(str(stl))
+    step_src = (
+        "from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder\n"
+        "from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt\n"
+        "from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer\n"
+        "import sys\n"
+        "ax = gp_Ax2(gp_Pnt(0, 0, -10), gp_Dir(0, 0, 1))\n"
+        "w = STEPControl_Writer()\n"
+        "w.Transfer(BRepPrimAPI_MakeCylinder(ax, 10.0, 20.0).Shape(), STEPControl_AsIs)\n"
+        "w.Write(sys.argv[1])\n"
+    )
+    monkeypatch.setattr(feature, "_candidates", lambda stl_, wd: [
+        ("block", [sys.executable, "-c", step_src, str(wd / "E.step")], {}, wd / "E.step")])
+    ref = feature.reconstruct(stl, tmp_path / "ref.step")
+    keep = tmp_path / "keep"
+    assert feature.main([str(stl), "-o", str(tmp_path / "unused.step"), "--collect", str(keep)]) == 0
+    data = json.loads((keep / "cands.json").read_text())
+    got = feature.choose(data["cands"], 0)
+    assert got and got["method"] == ref["method"] == "block"
+    assert abs(got["dv_pct"] - ref["dv_pct"]) < 1e-9
+    assert feature.choose(data["cands"], 99) is None     # an engine with more cylinders keeps its own STEP
