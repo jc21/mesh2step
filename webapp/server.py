@@ -873,6 +873,8 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             # ponytail: when the engine result makes the rebuild moot, its process runs on to its own deadline
             eb = ThreadPoolExecutor(1).submit(_edgebuild_build, stl_path, Path(out_path).with_name("eb") / "edge_in.step")
             _PREBUILT.setdefault(str(out_path), {})["eb"] = eb
+            if progress is not None:
+                progress["eb_t"] = time.time()          # its own clock: after the engine it is what the user waits on
         # the feature builders need only the mesh too (the engine only sets the cylinder count to beat): all three
         # start together and the converter takes the longest of them, not their sum (owner, 2026-09-28)
         fb = None
@@ -1305,8 +1307,8 @@ def _read_parallel(progress: dict, par: dict) -> dict:
     now = "engine" if eng != "done" else "edgebuild" if ebs == "running" else "feature"
     return {"phase": now, "phase_i": min(finished + 1, units), "phase_n": units, "ceiling_s": FEATURE_CEILING_S,
             "parallel": {"engine": eng, "edgebuild": ebs, "feature_done": k, "feature_n": n},
-            **(_timing(progress.get("stage_t"), _STAGE_BUDGET_S.get(stage, CONVERT_TIMEOUT_S))
-               if eng != "done" else _timing(None, 0))}
+            **(_timing(progress.get("stage_t"), _STAGE_BUDGET_S.get(stage, CONVERT_TIMEOUT_S)) if eng != "done"
+               else _timing(progress.get("eb_t"), EDGEBUILD_TIMEOUT_S) if now == "edgebuild" else _timing(None, 0))}
 
 
 def _read_progress(progress: dict | None) -> dict:

@@ -211,10 +211,13 @@ def test_parallel_stages_each_say_where_they_are(tmp_path):
     server._PREBUILT[key] = {"eb": Fut(False), "fb": (Fut(False), tmp_path)}
     try:
         running = server._read_progress({"par": key, "phase_file": str(log), "stage": "engine", "stage_t": 0})
-        done = server._read_progress({"par": key, "phase_file": str(log), "stage": "engine", "engine_done": True})
+        done = server._read_progress({"par": key, "phase_file": str(log), "stage": "engine", "engine_done": True,
+                                      "eb_t": 1.0})
     finally:
         server._PREBUILT.pop(key, None)
     assert running["parallel"] == {"engine": "running", "edgebuild": "running", "feature_done": 3, "feature_n": 7}
     assert running["phase"] == "engine" and running["phase_n"] == 9 and running["phase_i"] == 4
     assert done["parallel"]["engine"] == "done" and done["phase"] == "edgebuild" and done["phase_i"] == 5
+    assert done["step_budget_s"] == server.EDGEBUILD_TIMEOUT_S and done["step_elapsed_s"] > 0, \
+        "after the engine the bar runs on the rebuild's own clock (it sat still near 89%)"
     assert server._read_progress({"par": "gone"}) == {}     # the conversion ended: no stale entry, no progress
