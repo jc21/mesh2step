@@ -680,9 +680,22 @@ def _edgebuild_upgrade(stl_path, out_path, res) -> dict:
     import signal
     import subprocess
 
-    if (os.environ.get("MESH2STEP_EDGEBUILD", "1") == "0" or not res.get("ok")
-            or (res.get("triangles") or 0) > EDGEBUILD_MAX_TRIS):
+    if not _edgebuild_eligible(res.get("triangles")) or not res.get("ok"):
         return res
+    return _edgebuild_apply(_edgebuild_build(stl_path, out_path), out_path, res)
+
+
+def _edgebuild_eligible(n_tris) -> bool:
+    return os.environ.get("MESH2STEP_EDGEBUILD", "1") != "0" and (n_tris or 0) <= EDGEBUILD_MAX_TRIS
+
+
+def _edgebuild_build(stl_path, out_path):
+    """The rebuild itself: needs only the mesh, so it can run while the engine converts (owner, 2026-09-28: run
+    edgebuild in parallel with the engine). -> (edge.step path or None, per-body metrics, body count)."""
+    import ast
+    import signal
+    import subprocess
+
     deadline = time.time() + EDGEBUILD_TIMEOUT_S
 
     def _run(args, env_extra, script=EDGEBUILD):
@@ -723,9 +736,8 @@ def _edgebuild_upgrade(stl_path, out_path, res) -> dict:
                 and abs(m["dv_pct"]) <= EDGE_MAX_DV_PCT and m["dist_p95"] <= EDGE_MAX_P95_REL * m["diag"]):
             break
         metrics.append(m)
-    before = res.get("smoothBuiltCylinders") or 0
     final = Path(out_path).with_name("edge.step")
-    ok = len(metrics) == n_bodies and sum(m["cylinders"] for m in metrics) >= before
+    ok = len(metrics) == n_bodies
     if ok and n_bodies > 1:
         rc, out = _run(["--combine", str(final), *map(str, cands)], {})
         ok = rc == 0 and f"COMBINED {n_bodies}" in out
@@ -735,6 +747,15 @@ def _edgebuild_upgrade(stl_path, out_path, res) -> dict:
         c.unlink(missing_ok=True)
     if not ok or not final.exists():
         final.unlink(missing_ok=True)
+        return None, metrics, n_bodies
+    return final, metrics, n_bodies
+
+
+def _edgebuild_apply(built, out_path, res) -> dict:
+    """The rebuild served in place of the engine STEP if it passed and has at least the engine's cylinders."""
+    final, metrics, n_bodies = built
+    before = res.get("smoothBuiltCylinders") or 0
+    if final is None or not final.exists() or sum(m["cylinders"] for m in metrics) < before:
         return res
     final.replace(out_path)
     planes = sum(m["planes"] for m in metrics); cyls = sum(m["cylinders"] for m in metrics)
@@ -797,6 +818,13 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
                 "engine can take; the shape was rebuilt from recognised surfaces instead",
                 *(res.get("warnings") or []),
             ]
+        # the shape rebuild needs only the mesh: it runs beside the engine instead of after it (its 900 s used to add
+        # to the engine's; 743 of 2309 probe runs ran their whole budget and served nothing)
+        eb = None
+        if engine == "trueform" and not feature_only and _edgebuild_eligible(n_in_tris):
+            Path(out_path).with_name("eb").mkdir(exist_ok=True)
+            # ponytail: when the engine result makes the rebuild moot, its process runs on to its own deadline
+            eb = ThreadPoolExecutor(1).submit(_edgebuild_build, stl_path, Path(out_path).with_name("eb") / "edge_in.step")
         try:
             # skipped entirely for an oversize mesh: the engine is what cannot take it
             _stage(progress, "engine")
@@ -840,10 +868,10 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             # the engine hung or failed: the rebuild does not need its output, only the mesh. Served only if it passes
             # the same gate; otherwise the engine's error stands.
             _stage(progress, "edgebuild")
-            res = _edgebuild_upgrade(stl_path, out_path, {
-                "ok": True, "triangles": n_in_tris, "smoothBuiltCylinders": 0,
-                "warnings": [f"the conversion engine did not finish ({type(e).__name__}); the shape was rebuilt without it"],
-            })
+            stub = {"ok": True, "triangles": n_in_tris, "smoothBuiltCylinders": 0,
+                    "warnings": [f"the conversion engine did not finish ({type(e).__name__}); "
+                                 "the shape was rebuilt without it"]}
+            res = _edgebuild_apply(eb.result(), out_path, stub) if eb else _edgebuild_upgrade(stl_path, out_path, stub)
             if res.get("featureMethod") != "edgebuild":
                 raise
         if engine == "trueform" and res.get("ok") and not res.get("featureMethod"):
@@ -851,7 +879,7 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             res = _retry_broken_trueform(stl_path, out_path, res, schema=schema,
                                          unify_angle=native_unify)
             _stage(progress, "edgebuild")
-            res = _edgebuild_upgrade(stl_path, out_path, res)
+            res = _edgebuild_apply(eb.result(), out_path, res) if eb else _edgebuild_upgrade(stl_path, out_path, res)
         if (engine == "trueform" and res.get("ok") and not res.get("featureMethod")
                 and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")):
             res = _feature_upgrade(stl_path, out_path, progress) or res
