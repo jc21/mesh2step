@@ -1103,7 +1103,8 @@ function updateWork(data, secs, note) {
     const budget = data.step_budget_s || 0, spent = data.step_elapsed_s || 0;
     const frac = budget ? Math.min(0.95, spent / budget) : 0.5;
     workFill.style.width = `${Math.round(100 * (data.phase_i - 1 + frac) / data.phase_n)}%`;
-    workStep.textContent = `Step ${data.phase_i} of ${data.phase_n}: ${PHASE_WORDS[data.phase] || data.phase}`
+    workStep.textContent = data.parallel ? parallelText(data.parallel)
+      : `Step ${data.phase_i} of ${data.phase_n}: ${PHASE_WORDS[data.phase] || data.phase}`
       + (budget ? ` — ${fmtTime(Math.round(spent))} of at most ${Math.round(budget / 60)} min` : '');
   } else {
     workBar.classList.add('indeterminate');
@@ -1202,13 +1203,23 @@ const PHASE_WORDS = {
   'turned-envelope': 'looking for a turned shape',
   turned: 'cutting the turned shape',
   block: 'rebuilding as a block with features',
+  feature: 'choosing the best feature build',
 };
+
+// the engine, the shape rebuild and the feature builds run side by side: say where each one is
+function parallelText(p) {
+  const eng = { running: 'converting', retrying: 'retrying', done: 'done' }[p.engine] || p.engine;
+  return `Engine: ${eng}`
+    + (p.edgebuild ? ` · Shape rebuild: ${p.edgebuild === 'done' ? 'done' : 'running'}` : '')
+    + (p.feature_n ? ` · Feature builds: ${p.feature_done} of ${p.feature_n} done` : '');
+}
 
 function describeProgress(data, secs) {
   if (data.queue_position) return `Waiting in line — number ${data.queue_position} (${secs}s)`;
   if (!data.phase_n) return `Still converting — ${secs}s. Large models take a few minutes.`;
   const what = PHASE_WORDS[data.phase] || data.phase;
   const ceiling = Math.round((data.ceiling_s || 0) / 60);
+  if (data.parallel) return `${parallelText(data.parallel)} (${secs}s)` + (ceiling ? `. It stops by itself after ${ceiling} min.` : '');
   return `Step ${data.phase_i} of ${data.phase_n} — ${what} (${secs}s)`
        + (ceiling ? `. It stops by itself after ${ceiling} min.` : '');
 }

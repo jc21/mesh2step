@@ -143,7 +143,8 @@ def test_a_qualifying_build_carries_its_phase_profile(tmp_path, monkeypatch):
     assert best["phases"][0][1] > 0 and best["phases"][0][2] == "done"
     assert feature.native_payload(best, stl, tmp_path / "out.step", 1.0)["featurePhases"] \
         == best["phases"], "the profile must reach the payload every caller renders"
-    assert log.read_text().count("\n") == 2, "one start line and one done line"
+    states = [json.loads(l)["state"] for l in log.read_text().splitlines()]
+    assert states == ["start", "built", "done"], "start, built (the build finished), done (it was measured)"
 
 
 def test_a_timed_out_candidate_is_recorded_as_such(tmp_path, monkeypatch):
@@ -190,3 +191,30 @@ def test_collect_then_choose_picks_what_reconstruct_picks(tmp_path, monkeypatch)
     assert got and got["method"] == ref["method"] == "block"
     assert abs(got["dv_pct"] - ref["dv_pct"]) < 1e-9
     assert feature.choose(data["cands"], 99) is None     # an engine with more cylinders keeps its own STEP
+
+
+def test_parallel_stages_each_say_where_they_are(tmp_path):
+    """Engine, shape rebuild and feature builds run side by side: the progress names each one's state instead of a
+    single step count read off the builders' file (which showed "8 of 8" while the engine was still converting)."""
+    class Fut:
+        def __init__(self, done):
+            self._d = done
+
+        def done(self):
+            return self._d
+
+    log = tmp_path / "phases.jsonl"
+    log.write_text("".join(json.dumps({"i": i, "n": 7, "label": l, "state": s, "t": 0}) + "\n" for i, l, s in
+                           [(1, "extrude-x", "start"), (1, "extrude-x", "built"), (2, "extrude-y", "built"),
+                            (4, "stepped", "timeout"), (5, "turned-envelope", "start")]))
+    key = str(tmp_path / "out.step")
+    server._PREBUILT[key] = {"eb": Fut(False), "fb": (Fut(False), tmp_path)}
+    try:
+        running = server._read_progress({"par": key, "phase_file": str(log), "stage": "engine", "stage_t": 0})
+        done = server._read_progress({"par": key, "phase_file": str(log), "stage": "engine", "engine_done": True})
+    finally:
+        server._PREBUILT.pop(key, None)
+    assert running["parallel"] == {"engine": "running", "edgebuild": "running", "feature_done": 3, "feature_n": 7}
+    assert running["phase"] == "engine" and running["phase_n"] == 9 and running["phase_i"] == 4
+    assert done["parallel"]["engine"] == "done" and done["phase"] == "edgebuild" and done["phase_i"] == 5
+    assert server._read_progress({"par": "gone"}) == {}     # the conversion ended: no stale entry, no progress

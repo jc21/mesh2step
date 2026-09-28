@@ -253,6 +253,7 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
             try:
                 subprocess.run([str(a) for a in argv], capture_output=True, timeout=timeout,
                                env=dict(os.environ, **env), cwd=td)
+                _phase(i + 1, len(cands), label, "built", time.time() - t_c)   # counted by the progress line
                 return time.time() - t_c, "done"
             except subprocess.TimeoutExpired:
                 _phase(i + 1, len(cands), label, "timeout", time.time() - t_c)

@@ -884,6 +884,8 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
                 progress["phase_file"] = str(phase_file)
             fb = (ThreadPoolExecutor(1).submit(_feature_collect, stl_path, keep, phase_file), keep)
             _PREBUILT.setdefault(str(out_path), {})["fb"] = fb
+        if progress is not None and str(out_path) in _PREBUILT:
+            progress["par"] = str(out_path)
         try:
             # skipped entirely for an oversize mesh: the engine is what cannot take it
             _stage(progress, "engine")
@@ -933,6 +935,8 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             res = _edgebuild_upgrade(stl_path, out_path, stub)
             if res.get("featureMethod") != "edgebuild":
                 raise
+        if progress is not None:
+            progress["engine_done"] = True
         # order: the rebuild, then the feature build, then (only if neither is served) the engine retries. A retry
         # is kept only with the engine's cylinder count unchanged (_retry_broken_trueform), and that count is all the
         # rebuild's and the feature build's choices read from the engine, so they choose as before; the retry's STEP
@@ -1271,9 +1275,49 @@ def _n_phases() -> int:
     return 1 + len(_candidates(Path("x.stl"), Path(tempfile.gettempdir())))
 
 
+def _builds_finished(path) -> tuple[int, int]:
+    """(feature builds finished, builds in all) from the builders' phase file: built / done / timeout lines."""
+    k, n = set(), max(_n_phases() - 1, 1)
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.strip():
+                    rec = json.loads(line)
+                    n = rec.get("n", n)
+                    if rec.get("state") in ("built", "done", "timeout"):
+                        k.add(rec.get("label"))
+    except (OSError, ValueError, TypeError):
+        pass
+    return min(len(k), n), n
+
+
+def _read_parallel(progress: dict, par: dict) -> dict:
+    """The stages that run side by side (engine, shape rebuild, feature builds) each with its own state: a single
+    "step i of n" read the builders' file while the engine was still converting, then sat at 8 of 8 through the
+    engine and the rebuild (2026-09-28)."""
+    stage = progress.get("stage")
+    eng = "retrying" if stage == "retry" else ("done" if progress.get("engine_done") else "running")
+    eb = par.get("eb")
+    ebs = None if eb is None else ("done" if eb.done() else "running")
+    k, n = _builds_finished(progress.get("phase_file")) if par.get("fb") else (0, 0)
+    units = 1 + (eb is not None) + n
+    finished = (eng == "done") + (ebs == "done") + k
+    now = "engine" if eng != "done" else "edgebuild" if ebs == "running" else "feature"
+    return {"phase": now, "phase_i": min(finished + 1, units), "phase_n": units, "ceiling_s": FEATURE_CEILING_S,
+            "parallel": {"engine": eng, "edgebuild": ebs, "feature_done": k, "feature_n": n},
+            **(_timing(progress.get("stage_t"), _STAGE_BUDGET_S.get(stage, CONVERT_TIMEOUT_S))
+               if eng != "done" else _timing(None, 0))}
+
+
 def _read_progress(progress: dict | None) -> dict:
     """What the user is waiting for right now. Never raises -- progress must not cost a result."""
     progress = progress or {}
+    par = _PREBUILT.get(progress.get("par") or "")
+    if par:
+        try:
+            return _read_parallel(progress, par)
+        except Exception:                               # noqa: BLE001 -- progress must not cost a result
+            return {}
     n = _n_phases()
     path = progress.get("phase_file")
     # The engine runs first and is where a slow conversion usually spends its 600 s. Without
