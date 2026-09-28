@@ -228,16 +228,41 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
     with tempfile.TemporaryDirectory(prefix="m2s_feature_") as td:
         wd = Path(td)
         cands = _candidates(stl, wd)
-        for i, (label, argv, env, produced) in enumerate(cands, 1):
-            _phase(i, len(cands), label, "start")
+        # the builders run at once (the owner, 2026-09-28: every conversion within 300 s); only "turned" waits for
+        # "turned-envelope", whose output it cuts. They are then measured and chosen IN THE ORDER BELOW, exactly
+        # as when they ran one after another, so the same build wins (ties still go to the earlier builder).
+        from concurrent.futures import ThreadPoolExecutor
+
+        def build(i):
+            label, argv, env, _ = cands[i]
+            _phase(i + 1, len(cands), label, "start")
             t_c = time.time()
             try:
                 subprocess.run([str(a) for a in argv], capture_output=True, timeout=timeout,
                                env=dict(os.environ, **env), cwd=td)
+                return time.time() - t_c, "done"
             except subprocess.TimeoutExpired:
-                _phase(i, len(cands), label, "timeout", time.time() - t_c)
-                phases.append([label, round(time.time() - t_c, 3), "timeout"])
+                _phase(i + 1, len(cands), label, "timeout", time.time() - t_c)
+                return time.time() - t_c, "timeout"
+
+        labels = [c[0] for c in cands]
+        chain = {labels.index("turned-envelope"): labels.index("turned")}   # envelope -> its cut
+        after = set(chain.values())
+        runs = {}
+        with ThreadPoolExecutor(len(cands)) as ex:
+            futs = {i: ex.submit(lambda i=i: [build(i)] + ([build(chain[i])] if i in chain else []))
+                    for i in range(len(cands)) if i not in after}
+            for i, f in futs.items():
+                got = f.result()
+                runs[i] = got[0]
+                if i in chain:
+                    runs[chain[i]] = got[1]
+        for i, (label, argv, env, produced) in enumerate(cands, 1):
+            took, state = runs[i - 1]
+            if state == "timeout":
+                phases.append([label, round(took, 3), "timeout"])
                 continue
+            t_c = time.time() - took
             try:
                 m = measure(produced, tri) if produced.exists() else None
             except Exception as exc:  # noqa: BLE001
