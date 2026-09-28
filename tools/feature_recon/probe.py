@@ -84,7 +84,10 @@ def main():
     deadline = time.time() + BUDGET
     rc, stdout, sec = build(src, out, {}, deadline)
     cls, m = classify(rc, stdout)
-    record = {"mesh": str(src), "body": os.environ.get("EB_BODY"), "default": cls, "tried": [], "winner": None}
+    # default_sec: how long the default build took, pass or fail (2026-09-28: 1482 default wins had no time, so no
+    # early give-up could be set from data)
+    record = {"mesh": str(src), "body": os.environ.get("EB_BODY"), "default": cls, "default_sec": round(sec, 1),
+              "tried": [], "winner": None}
     if cls == "pass" or cls not in LADDERS:
         record["winner"] = {} if cls == "pass" else None
         _log(record)
