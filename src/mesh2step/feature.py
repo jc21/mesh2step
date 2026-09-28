@@ -217,14 +217,27 @@ def acceptable(m: dict | None) -> bool:
                 and m["dist_p95"] <= MAX_DIST_P95_REL * m["diag"])
 
 
+def choose(cands, n: int) -> dict | None:
+    """The build reconstruct() would keep against an engine with n cylinders: in builder order, the qualifying
+    one closest to the mesh volume (ties to the earlier builder)."""
+    best = None
+    for label, m in cands:
+        if (m and acceptable(m) and m["cylinders"] > n and m.get("support", 0.0) >= MIN_SUPPORT
+                and (best is None or abs(m["dv_pct"]) < abs(best["dv_pct"]))):
+            best = dict(m, method=label)
+    return best
+
+
 def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_TIMEOUT_S,
-                log=None) -> dict | None:
-    """Try every builder; keep the qualifying build closest to the mesh volume."""
+                log=None, keep: Path | None = None) -> dict | None:
+    """Try every builder; keep the qualifying build closest to the mesh volume. keep: also copy every build
+    and its measures there (cands.json), for a choice made later against the engine's cylinder count."""
     stl, out = Path(stl), Path(out)
     tri = _mesh(stl)
     mesh_radii = None
     best = None
     phases: list[list] = []
+    collected: list = []
     with tempfile.TemporaryDirectory(prefix="m2s_feature_") as td:
         wd = Path(td)
         cands = _candidates(stl, wd)
@@ -246,7 +259,8 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
                 return time.time() - t_c, "timeout"
 
         labels = [c[0] for c in cands]
-        chain = {labels.index("turned-envelope"): labels.index("turned")}   # envelope -> its cut
+        chain = ({labels.index("turned-envelope"): labels.index("turned")}   # envelope -> its cut
+                 if "turned-envelope" in labels and "turned" in labels else {})
         after = set(chain.values())
         runs = {}
         with ThreadPoolExecutor(len(cands)) as ex:
@@ -277,19 +291,25 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
             # or the elapsed times never add up to the wall clock an ETA is fitted against
             _phase(i, len(cands), label, "done", time.time() - t_c)
             phases.append([label, round(time.time() - t_c, 3), "done"])
-            if acceptable(m) and m["cylinders"] > min_cylinders:
+            if acceptable(m) and m["cylinders"] > (0 if keep is not None else min_cylinders):
                 if mesh_radii is None:
                     mesh_radii = mesh_cylinder_radii(tri)
                 m["support"] = support(m["radii"], mesh_radii)
             if log:
                 brief = {k: v for k, v in (m or {}).items() if k != "radii"}
                 print(f"feature {label}: {brief}", file=log, flush=True)
+            if keep is not None:
+                if m is not None:
+                    shutil.copyfile(produced, Path(keep) / f"{label}.step")
+                collected.append([label, {k: v for k, v in m.items() if k != "radii"} if m else None])
             if (m and m.get("support", 0.0) >= MIN_SUPPORT
                     and (best is None or abs(m["dv_pct"]) < abs(best["dv_pct"]))):
                 best = dict(m, method=label)
                 shutil.copyfile(produced, wd / "best.step")
-        if best:
+        if best and out is not None:
             shutil.copyfile(wd / "best.step", out)
+    if keep is not None:
+        (Path(keep) / "cands.json").write_text(json.dumps({"cands": collected, "phases": phases}))
     if best is not None:
         best["phases"] = phases
     return best
@@ -323,6 +343,22 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     stl, out = Path(argv[0]), Path(argv[argv.index("-o") + 1])
     t0 = time.time()
+    if "--collect" in argv:                 # builds only, beside the engine (server: feature pass in parallel)
+        keep = Path(argv[argv.index("--collect") + 1]); keep.mkdir(parents=True, exist_ok=True)
+        reconstruct(stl, None, log=sys.stderr, keep=keep)
+        (keep / "seconds").write_text(f"{time.time() - t0:.3f}")
+        return 0
+    if "--choose" in argv:                  # the same choice as --no-fallback, against the finished engine STEP
+        keep = Path(argv[argv.index("--choose") + 1])
+        engine = Path(argv[argv.index("--engine-step") + 1]) if "--engine-step" in argv else None
+        data = json.loads((keep / "cands.json").read_text())
+        m = choose(data["cands"], _engine_cylinders(engine) if engine else 0)
+        if not m:
+            return 3
+        shutil.copyfile(keep / f"{m['method']}.step", out)
+        m["phases"] = data["phases"]
+        print("RESULT " + json.dumps(native_payload(m, stl, out, float((keep / "seconds").read_text()))))
+        return 0
     if "--no-fallback" in argv:
         engine = Path(argv[argv.index("--engine-step") + 1]) if "--engine-step" in argv else None
         n = _engine_cylinders(engine) if engine else 0

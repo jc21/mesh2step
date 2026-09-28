@@ -582,6 +582,9 @@ def _feature_upgrade(stl_path, out_path, progress: dict | None = None) -> dict |
     import signal
     import subprocess
 
+    pre = _PREBUILT.get(str(out_path), {}).get("fb")    # builders started with the engine: choose among them
+    if pre is not None:
+        return _feature_choose(pre[1], out_path) if pre[0].result() else None
     cand = Path(out_path).with_name("feature.step")
     # A file, not a pipe: communicate() already owns stdout, and a second reader thread would
     # buy nothing but a deadlock to debug. The child appends, /api/job reads the last line.
@@ -604,6 +607,46 @@ def _feature_upgrade(stl_path, out_path, progress: dict | None = None) -> dict |
         return None
     lines = [ln for ln in stdout.splitlines() if ln.startswith("RESULT ")]
     if proc.returncode != 0 or not lines or not cand.exists():
+        return None
+    cand.replace(out_path)
+    res = json.loads(lines[-1][7:])
+    res["output"] = str(out_path)
+    return res
+
+
+def _feature_collect(stl_path, keep, phase_file):
+    """The feature builders, beside the engine: every build and its measures in `keep` (the choice needs the
+    engine's cylinder count, so it is made after, by _feature_choose). True when the builders finished."""
+    import signal
+    import subprocess
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mesh2step.feature", str(stl_path), "-o", str(Path(keep) / "unused.step"),
+             "--collect", str(keep)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            env=dict(os.environ, MESH2STEP_PHASE_LOG=str(phase_file)))
+        proc.wait(timeout=FEATURE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        return False
+    except OSError:
+        return False
+    return proc.returncode == 0 and (Path(keep) / "cands.json").exists()
+
+
+def _feature_choose(keep, out_path) -> dict | None:
+    """_feature_upgrade's choice on builds already made: same rule, the engine STEP now at out_path."""
+    import subprocess
+    cand = Path(out_path).with_name("feature.step")
+    try:
+        r = subprocess.run([sys.executable, "-m", "mesh2step.feature", str(out_path), "-o", str(cand),
+                            "--choose", str(keep), "--engine-step", str(out_path)],
+                           capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    lines = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULT ")]
+    if r.returncode != 0 or not lines or not cand.exists():
         return None
     cand.replace(out_path)
     res = json.loads(lines[-1][7:])
@@ -670,6 +713,9 @@ EDGE_MAX_DV_PCT = 1.0        # exact curved faces vs chord mesh: the corpus maxi
 EDGE_MAX_P95_REL = 0.005     # of the diagonal, same limit as the feature pass
 
 
+_PREBUILT: dict = {}      # str(out_path) -> {"eb": future, "fb": (future, dir)}: builds started beside the engine
+
+
 def _edgebuild_upgrade(stl_path, out_path, res) -> dict:
     """Replace the engine STEP with the exact-intersection shape rebuild when it passes the gate.
 
@@ -682,7 +728,8 @@ def _edgebuild_upgrade(stl_path, out_path, res) -> dict:
 
     if not _edgebuild_eligible(res.get("triangles")) or not res.get("ok"):
         return res
-    return _edgebuild_apply(_edgebuild_build(stl_path, out_path), out_path, res)
+    pre = _PREBUILT.get(str(out_path), {}).get("eb")    # started with the engine (the worker), else built now
+    return _edgebuild_apply(pre.result() if pre else _edgebuild_build(stl_path, out_path), out_path, res)
 
 
 def _edgebuild_eligible(n_tris) -> bool:
@@ -825,6 +872,18 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             Path(out_path).with_name("eb").mkdir(exist_ok=True)
             # ponytail: when the engine result makes the rebuild moot, its process runs on to its own deadline
             eb = ThreadPoolExecutor(1).submit(_edgebuild_build, stl_path, Path(out_path).with_name("eb") / "edge_in.step")
+            _PREBUILT.setdefault(str(out_path), {})["eb"] = eb
+        # the feature builders need only the mesh too (the engine only sets the cylinder count to beat): all three
+        # start together and the converter takes the longest of them, not their sum (owner, 2026-09-28)
+        fb = None
+        if (engine == "trueform" and not feature_only
+                and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")):
+            keep = Path(out_path).with_name("fb"); keep.mkdir(exist_ok=True)
+            phase_file = Path(out_path).with_name("phases.jsonl")
+            if progress is not None:
+                progress["phase_file"] = str(phase_file)
+            fb = (ThreadPoolExecutor(1).submit(_feature_collect, stl_path, keep, phase_file), keep)
+            _PREBUILT.setdefault(str(out_path), {})["fb"] = fb
         try:
             # skipped entirely for an oversize mesh: the engine is what cannot take it
             _stage(progress, "engine")
@@ -871,18 +930,23 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             stub = {"ok": True, "triangles": n_in_tris, "smoothBuiltCylinders": 0,
                     "warnings": [f"the conversion engine did not finish ({type(e).__name__}); "
                                  "the shape was rebuilt without it"]}
-            res = _edgebuild_apply(eb.result(), out_path, stub) if eb else _edgebuild_upgrade(stl_path, out_path, stub)
+            res = _edgebuild_upgrade(stl_path, out_path, stub)
             if res.get("featureMethod") != "edgebuild":
                 raise
+        # order: the rebuild, then the feature build, then (only if neither is served) the engine retries. A retry
+        # is kept only with the engine's cylinder count unchanged (_retry_broken_trueform), and that count is all the
+        # rebuild's and the feature build's choices read from the engine, so they choose as before; the retry's STEP
+        # only matters when the engine's own STEP is served (part 6: 1264 s of retries, then the feature build won)
+        if engine == "trueform" and res.get("ok") and not res.get("featureMethod"):
+            _stage(progress, "edgebuild")
+            res = _edgebuild_upgrade(stl_path, out_path, res)
+        if (engine == "trueform" and res.get("ok") and not res.get("featureMethod")
+                and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")):
+            res = _feature_upgrade(stl_path, out_path, progress) or res
         if engine == "trueform" and res.get("ok") and not res.get("featureMethod"):
             _stage(progress, "retry")
             res = _retry_broken_trueform(stl_path, out_path, res, schema=schema,
                                          unify_angle=native_unify)
-            _stage(progress, "edgebuild")
-            res = _edgebuild_apply(eb.result(), out_path, res) if eb else _edgebuild_upgrade(stl_path, out_path, res)
-        if (engine == "trueform" and res.get("ok") and not res.get("featureMethod")
-                and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")):
-            res = _feature_upgrade(stl_path, out_path, progress) or res
     except NativeTimeout:
         __import__("shutil").rmtree(workdir, ignore_errors=True)
         raise HTTPException(504, (
@@ -897,6 +961,7 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
         raise HTTPException(502, f"The conversion engine failed: {e}") from e
     finally:
         _CONVERT_SLOTS.release()
+        _PREBUILT.pop(str(out_path), None)
         # The queue is sized on how long conversions ACTUALLY take here, not on
         # how long they took on the machine the constants were written on. A
         # timed-out or failed run counts too: it held the slot just the same.
