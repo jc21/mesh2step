@@ -28,15 +28,20 @@ CALLS = []
 def timed(name, fn):
     def w(*a, **k):
         t0 = time.time()
+        print(f"MARK {name} start {t0:.2f}", flush=True)
         try:
             return fn(*a, **k)
         finally:
-            CALLS.append((name, round(time.time() - t0, 1)))
+            t1 = time.time()
+            print(f"MARK {name} end {t1:.2f}", flush=True)
+            CALLS.append((name, round(t1 - t0, 1)))
     return w
 
 
-for n in ("convert_native", "_feature_upgrade", "_edgebuild_upgrade", "_retry_broken_trueform"):
-    setattr(S, n, timed(n, getattr(S, n)))
+for n in ("convert_native", "_feature_upgrade", "_edgebuild_upgrade", "_retry_broken_trueform",
+          "_edgebuild_build", "_edgebuild_apply"):     # the last two exist only where edgebuild runs beside the engine
+    if hasattr(S, n):
+        setattr(S, n, timed(n, getattr(S, n)))
 
 out = Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True)
 c = TestClient(S.app)
